@@ -8,7 +8,6 @@ A macOS menu bar application that bridges Apple Intelligence (on-device Foundati
 - **OpenAI API Compatible**: Drop-in replacement for OpenAI API clients
 - **Ollama API Compatible**: Works with applications that support Ollama
 - **Menu Bar Integration**: Start, stop, and configure the server from your menu bar
-- **Built-in Chat Interface**: Test the AI directly within the app
 - **Streaming Support**: Server-sent events (SSE) and NDJSON streaming
 - **Tool Calling**: Basic file system tools (read, write, list directory)
 - **Privacy First**: All processing happens on-device
@@ -51,11 +50,18 @@ open "Perspective Intelligence.xcodeproj"
 4. The status indicator is green when the server is running.
 5. Use the controls to stop, restart, or change the port if needed.
 
-### Testing with the Built-in Chat
+### Testing the API
 
-1. Open the Chat window from the menu bar or use the keyboard shortcut.
-2. Type a message and press Return or click Send.
-3. The response comes from Apple Intelligence running locally on your Mac.
+You can test the server using curl or any HTTP client:
+
+```bash
+curl http://127.0.0.1:11434/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "apple.local",
+    "messages": [{"role": "user", "content": "Hello!"}]
+  }'
+```
 
 ### Configuring Settings
 
@@ -177,6 +183,65 @@ curl -X POST http://127.0.0.1:11434/debug/echo \
 ```
 
 ## Using with Third-Party Applications
+
+### Xcode 26 Intelligence Mode
+
+Xcode 26 introduces Intelligence Mode, an AI-powered assistant with Agent Mode that provides context-aware code suggestions. You can configure Xcode to use Perspective Intelligence as a locally hosted model provider.
+
+#### Setup Instructions
+
+1. Launch Perspective Intelligence and ensure the server is running (green status indicator in menu bar).
+
+2. Open Xcode 26 and go to **Xcode > Settings** (or press Cmd + ,).
+
+3. Navigate to the **Intelligence Mode** tab.
+
+4. Click **Add a Model Provider** and select **Locally Hosted**.
+
+5. Enter the following configuration:
+
+| Setting | Value |
+|---------|-------|
+| Port | 11434 (or your configured port) |
+| Description | Perspective Intelligence |
+
+6. Click **Add** to save the configuration.
+
+7. If successful, you should see **apple.local** appear in the list of available models.
+
+8. Select **apple.local** as your active model.
+
+#### Using Intelligence Mode
+
+Once configured, you can access Intelligence Mode in Xcode:
+
+- Press **Cmd + 0** to open the Coding Assistant panel
+- Use Agent Mode to get context-aware suggestions based on your project
+- The AI can assist with code generation, refactoring, and explanations
+
+#### Benefits of Using Perspective Intelligence with Xcode
+
+- **Privacy**: All processing happens on-device using Apple Intelligence
+- **No API Costs**: Unlike cloud-hosted models, there are no usage fees
+- **No Internet Required**: Works completely offline after initial setup
+- **Native Integration**: Leverages Apple's optimized on-device Foundation Models
+
+#### Troubleshooting Xcode Integration
+
+If the model doesn't appear in Xcode:
+
+1. Verify Perspective Intelligence server is running (check the menu bar icon)
+2. Confirm the port number matches your server configuration
+3. Restart Xcode after adding the model provider
+4. Check that Apple Intelligence is enabled on your Mac
+
+For comparison, you can also configure cloud-hosted models in Xcode 26 Intelligence Mode:
+
+- **Anthropic Claude**: Use URL `https://api.anthropic.com/v1/messages` with header `x-api-key`
+- **OpenAI**: Use URL `https://api.openai.com` with header `x-api-key`
+- **OpenRouter**: Use a middleware aggregator for access to multiple models
+
+However, Perspective Intelligence offers the advantage of completely local, private AI assistance without requiring API keys or incurring usage costs.
 
 ### Cursor IDE
 
