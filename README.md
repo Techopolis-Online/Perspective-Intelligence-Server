@@ -15,10 +15,10 @@ A macOS menu bar application that bridges Apple Intelligence (on-device Foundati
 
 ## Requirements
 
-- macOS 15.0 (Sequoia) or later
+- macOS 26.0 (Tahoe) or later
 - Apple Silicon Mac (M1 or later)
 - Apple Intelligence enabled on your device
-- Xcode 16.0 or later (for building from source)
+- Xcode 26.0 or later (for building from source)
 
 ## Installation
 
@@ -46,10 +46,10 @@ open "Perspective Intelligence.xcodeproj"
 ### Starting the Server
 
 1. Launch Perspective Intelligence. The app appears in your menu bar with a lightning bolt icon.
-2. Click the menu bar icon to open the server controls.
-3. Configure the port (default: 11434) if needed.
-4. Click **Start** to begin the server.
-5. The status indicator turns green when the server is running.
+2. The server starts automatically on port 11434 when the app launches.
+3. Click the menu bar icon to view server status and controls.
+4. The status indicator is green when the server is running.
+5. Use the controls to stop, restart, or change the port if needed.
 
 ### Testing with the Built-in Chat
 
@@ -241,7 +241,7 @@ export PI_WORKSPACE_ROOT=/path/to/your/workspace
 
 ### Server won't start
 
-- Ensure you're running macOS 15.0 or later on Apple Silicon
+- Ensure you're running macOS 26.0 (Tahoe) or later on Apple Silicon
 - Check that Apple Intelligence is enabled in System Settings
 - Verify the port isn't already in use by another application
 

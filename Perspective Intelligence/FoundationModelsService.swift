@@ -614,7 +614,7 @@ final class FoundationModelsService: @unchecked Sendable {
         logger.log("Generating text (FoundationModels if available, else fallback)")
 
         #if canImport(FoundationModels)
-        if #available(iOS 18.0, macOS 15.0, visionOS 2.0, *) {
+        if #available(iOS 26.0, macOS 26.0, visionOS 26.0, *) {
             do {
                 return try await generateWithFoundationModels(model: model, prompt: prompt, temperature: temperature)
             } catch {
@@ -631,7 +631,7 @@ final class FoundationModelsService: @unchecked Sendable {
     }
 
     #if canImport(FoundationModels)
-    @available(iOS 18.0, macOS 15.0, visionOS 2.0, *)
+    @available(iOS 26.0, macOS 26.0, visionOS 26.0, *)
     private func generateWithFoundationModels(model: String, prompt: String, temperature: Double?) async throws -> String {
         // Use the system-managed on-device language model
         let systemModel = SystemLanguageModel.default
@@ -718,7 +718,7 @@ extension FoundationModelsService {
 
             do {
                 #if canImport(FoundationModels)
-                if #available(iOS 18.0, macOS 15.0, visionOS 2.0, *) {
+                if #available(iOS 26.0, macOS 26.0, visionOS 26.0, *) {
                     // Create a fresh short-lived session per segment with tailored instructions
                     let session = LanguageModelSession(instructions: instructions(forRound: round))
                     let response = try await session.respond(to: prompt)
