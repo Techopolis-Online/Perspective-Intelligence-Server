@@ -11,29 +11,56 @@ actor LocalHTTPServer {
 
     var port: UInt16 = 11434
     private(set) var isRunning: Bool = false
+    private(set) var lastError: String? = nil
+    
+    /// Ports to try in order if the primary port is unavailable
+    private let fallbackPorts: [UInt16] = [11434, 11435, 11436, 11437, 8080]
+    private var currentPortIndex: Int = 0
 
     private init() {}
 
     // MARK: Lifecycle
 
     func start() async {
-        print("Server started.")
-        guard !isRunning else { return }
-        let currentPort = self.port
+        guard !isRunning else {
+            logger.log("Server already running, ignoring start request")
+            return
+        }
+        lastError = nil
+        currentPortIndex = 0
+        await tryStartOnNextPort()
+    }
+    
+    /// Attempts to start the server on the next available port in the fallback list
+    private func tryStartOnNextPort() async {
+        guard currentPortIndex < fallbackPorts.count else {
+            lastError = "Failed to start server: all ports in use (tried: \(fallbackPorts.map(String.init).joined(separator: ", ")))"
+            logger.error("\\(self.lastError ?? \"\")")
+            return
+        }
+        
+        let targetPort = fallbackPorts[currentPortIndex]
+        self.port = targetPort
+        
         do {
             let params = NWParameters.tcp
-            listener = try NWListener(using: params, on: NWEndpoint.Port(rawValue: currentPort)!)
+            listener = try NWListener(using: params, on: NWEndpoint.Port(rawValue: targetPort)!)
             listener?.stateUpdateHandler = { [weak self] state in
                 guard let self else { return }
-                Task { await self.handleListenerState(state, currentPort: currentPort) }
+                Task { await self.handleListenerState(state, currentPort: targetPort) }
             }
             listener?.newConnectionHandler = { [weak self] newConn in
                 guard let self else { return }
                 Task { await self.accept(newConn) }
             }
             listener?.start(queue: DispatchQueue.global())
+            logger.log("Server starting on port \(targetPort)...")
         } catch {
+            lastError = "Failed to create listener on port \(targetPort): \(error.localizedDescription)"
             logger.error("Failed to start listener: \(String(describing: error))")
+            // Try next port
+            currentPortIndex += 1
+            await tryStartOnNextPort()
         }
     }
 
@@ -540,9 +567,35 @@ actor LocalHTTPServer {
         case .ready:
             logger.log("HTTP server listening on 0.0.0.0:\(currentPort)")
             isRunning = true
+            lastError = nil
         case .failed(let error):
-            logger.error("Listener failed: \(String(describing: error))")
+            let isAddressInUse: Bool
+            if let posixError = error as? NWError,
+               case .posix(let code) = posixError,
+               code == .EADDRINUSE {
+                isAddressInUse = true
+            } else {
+                isAddressInUse = false
+            }
+            
+            logger.error("Listener failed on port \(currentPort): \(String(describing: error))")
+            listener?.cancel()
+            listener = nil
             isRunning = false
+            
+            // If address is in use, try the next port
+            if isAddressInUse {
+                currentPortIndex += 1
+                if currentPortIndex < fallbackPorts.count {
+                    logger.log("Port \(currentPort) in use, trying next port...")
+                    await tryStartOnNextPort()
+                } else {
+                    lastError = "All ports in use. Tried: \(fallbackPorts.map(String.init).joined(separator: ", "))"
+                    logger.error("\(self.lastError ?? "")")
+                }
+            } else {
+                lastError = "Server failed: \(error.localizedDescription)"
+            }
         case .cancelled:
             logger.log("Listener cancelled")
             isRunning = false
@@ -568,6 +621,14 @@ actor LocalHTTPServer {
 
     func getPort() -> UInt16 {
         port
+    }
+
+    func getLastError() -> String? {
+        lastError
+    }
+
+    func clearError() {
+        lastError = nil
     }
 }
 

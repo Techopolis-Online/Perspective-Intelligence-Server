@@ -266,7 +266,16 @@ final class FoundationModelsService: @unchecked Sendable {
 
     /// Handles an OpenAI-compatible chat completion request and returns a response.
     func handleChatCompletion(_ request: ChatCompletionRequest) async throws -> ChatCompletionResponse {
-        // If tools are provided, run the tool-calling orchestration flow.
+        // Always use tools for file operations - this enables the model to create/edit files
+        // even when the client doesn't explicitly request tool support
+        #if canImport(FoundationModels)
+        if #available(macOS 26.0, iOS 26.0, visionOS 26.0, *) {
+            // Use native Foundation Models with built-in file tools
+            return try await handleChatCompletionWithBuiltInTools(request)
+        }
+        #endif
+        
+        // Fallback for older systems: If tools are provided, run the tool-calling orchestration flow.
         if let tools = request.tools, !tools.isEmpty {
             return try await handleChatCompletionWithTools(request, tools: tools)
         }
@@ -294,9 +303,129 @@ final class FoundationModelsService: @unchecked Sendable {
         )
         return response
     }
+    
+    #if canImport(FoundationModels)
+    /// Handle chat completion with built-in file tools using native Foundation Models
+    /// IMPORTANT: Apple's on-device model has a strict 4096 token limit (~16K chars total including tools)
+    @available(macOS 26.0, iOS 26.0, visionOS 26.0, *)
+    private func handleChatCompletionWithBuiltInTools(_ request: ChatCompletionRequest) async throws -> ChatCompletionResponse {
+        let systemModel = SystemLanguageModel.default
+        
+        // Check availability
+        switch systemModel.availability {
+        case .available:
+            break
+        case .unavailable(let reason):
+            logger.error("[fm-builtin] Model unavailable: \(String(describing: reason))")
+            throw NSError(domain: "FoundationModelsService", code: 1, userInfo: [NSLocalizedDescriptionKey: "Model unavailable: \(String(describing: reason))"])
+        }
+        
+        // CRITICAL: Keep instructions VERY short - tool definitions take ~1500 tokens
+        // Total budget: 4096 tokens ≈ 16K chars, but tools+response need ~8K
+        // So we only have ~8K chars for instructions + prompt combined
+        let toolInstructions = """
+        You have file operation tools. Use them directly when asked:
+        - write_file: create/write files (path, content)
+        - read_file: read file contents (path)
+        - edit_file: modify files (path, oldText, newText)
+        - delete_file: remove files (path)
+        - list_directory: list folder contents (path)
+        - create_directory: make folders (path)
+        Use paths like: "file.txt" (saves to Documents), "~/Desktop/file.txt", etc.
+        ALWAYS use tools for file operations - never explain how to do it manually.
+        """
+        
+        // Extract ONLY the last user message - this is what they actually want
+        let userMessages = request.messages.filter { $0.role == "user" }
+        guard let lastUserMessage = userMessages.last else {
+            throw NSError(domain: "FoundationModelsService", code: 2, userInfo: [NSLocalizedDescriptionKey: "No user message found"])
+        }
+        
+        // Extract just the user's actual request from structured content
+        // Xcode sends huge context blobs - we need to find the actual question
+        var userRequest = lastUserMessage.content
+        
+        // Look for "The user has asked:" pattern from Xcode extension
+        if let askedRange = userRequest.range(of: "The user has asked:", options: .caseInsensitive) {
+            userRequest = String(userRequest[askedRange.upperBound...]).trimmingCharacters(in: .whitespacesAndNewlines)
+        } else if let askedRange = userRequest.range(of: "user:", options: [.caseInsensitive, .backwards]) {
+            // Fallback: get content after last "user:"
+            userRequest = String(userRequest[askedRange.upperBound...]).trimmingCharacters(in: .whitespacesAndNewlines)
+        }
+        
+        // Aggressively truncate to stay within context (leave room for tools + response)
+        // Max prompt: ~2000 chars to be safe (500 tokens)
+        let maxPromptChars = 2000
+        if userRequest.count > maxPromptChars {
+            userRequest = String(userRequest.prefix(maxPromptChars)) + "..."
+        }
+        
+        // Simple, direct prompt
+        let prompt = userRequest
+        
+        let totalChars = toolInstructions.count + prompt.count
+        let estimatedTokens = (totalChars + 3) / 4
+        logger.log("[fm-builtin] Creating session: instructions=\(toolInstructions.count) chars, prompt=\(prompt.count) chars, est tokens=\(estimatedTokens)")
+        
+        // Create session with file tools
+        let session = LanguageModelSession(
+            tools: [
+                ReadFileTool(),
+                WriteFileTool(),
+                EditFileTool(),
+                DeleteFileTool(),
+                MoveFileTool(),
+                ListDirectoryTool(),
+                CreateDirectoryTool(),
+                CheckPathTool()
+            ],
+            instructions: toolInstructions
+        )
+        
+        let response = try await session.respond(to: prompt)
+        logger.log("[fm-builtin] Got response len=\(response.content.count)")
+        
+        return ChatCompletionResponse(
+            id: "chatcmpl_" + UUID().uuidString.replacingOccurrences(of: "-", with: ""),
+            object: "chat.completion",
+            created: Int(Date().timeIntervalSince1970),
+            model: request.model,
+            choices: [
+                .init(index: 0, message: .init(role: "assistant", content: response.content), finish_reason: "stop")
+            ]
+        )
+    }
+    #endif
 
-    /// Tool-calling orchestration: prompt for a tool call, execute it, then get the final answer.
+    /// Tool-calling orchestration using native Foundation Models Tool protocol.
+    /// The LanguageModelSession handles tool execution automatically when tools are provided.
     private func handleChatCompletionWithTools(_ request: ChatCompletionRequest, tools: [OAITool]) async throws -> ChatCompletionResponse {
+        #if canImport(FoundationModels)
+        if #available(iOS 26.0, macOS 26.0, visionOS 26.0, *) {
+            do {
+                let output = try await generateWithNativeTools(request: request, tools: tools)
+                return ChatCompletionResponse(
+                    id: "chatcmpl_" + UUID().uuidString.replacingOccurrences(of: "-", with: ""),
+                    object: "chat.completion",
+                    created: Int(Date().timeIntervalSince1970),
+                    model: request.model,
+                    choices: [
+                        .init(index: 0, message: .init(role: "assistant", content: output), finish_reason: "stop")
+                    ]
+                )
+            } catch {
+                logger.error("[tools] Native tool calling failed: \(String(describing: error))")
+                // Fall through to legacy text-based approach
+            }
+        }
+        #endif
+        
+        // Legacy fallback: text-based tool calling for older systems
+        return try await handleChatCompletionWithToolsLegacy(request, tools: tools)
+    }
+    
+    /// Legacy text-based tool calling (fallback when native tools unavailable)
+    private func handleChatCompletionWithToolsLegacy(_ request: ChatCompletionRequest, tools: [OAITool]) async throws -> ChatCompletionResponse {
         // Build an augmented system instruction describing available tools and the exact JSON contract.
         let toolIntro = toolsDescription(tools)
         var msgs: [ChatCompletionRequest.Message] = []
@@ -339,58 +468,138 @@ final class FoundationModelsService: @unchecked Sendable {
             )
         }
     }
+    
+    #if canImport(FoundationModels)
+    /// Generate response using native Foundation Models Tool protocol.
+    /// The session automatically handles tool calling and execution.
+    /// CRITICAL: Must stay within 4096 token limit (~16K chars total)
+    @available(iOS 26.0, macOS 26.0, visionOS 26.0, *)
+    private func generateWithNativeTools(request: ChatCompletionRequest, tools: [OAITool]) async throws -> String {
+        let systemModel = SystemLanguageModel.default
+        
+        // Check availability
+        switch systemModel.availability {
+        case .available:
+            break
+        case .unavailable(let reason):
+            throw NSError(domain: "FoundationModelsService", code: 1, userInfo: [NSLocalizedDescriptionKey: "Model unavailable: \(String(describing: reason))"])
+        }
+        
+        // VERY short instructions - tool definitions already take ~1500 tokens
+        let instructions = """
+        You have file tools. Use them directly for file operations:
+        - write_file(path, content): create/write files
+        - read_file(path): read files
+        - edit_file(path, oldText, newText): modify files
+        - delete_file(path): remove files
+        Use simple paths like "file.txt" or "~/Desktop/file.txt".
+        """
+        
+        // Extract ONLY the last user message's actual request
+        let userMessages = request.messages.filter { $0.role == "user" }
+        var prompt = userMessages.last?.content ?? ""
+        
+        // Extract the actual request if wrapped in Xcode boilerplate
+        if let askedRange = prompt.range(of: "The user has asked:", options: .caseInsensitive) {
+            prompt = String(prompt[askedRange.upperBound...]).trimmingCharacters(in: .whitespacesAndNewlines)
+        }
+        
+        // Strictly limit prompt size
+        if prompt.count > 2000 {
+            prompt = String(prompt.prefix(2000)) + "..."
+        }
+        
+        // Create session with file tools - the session handles tool calling automatically
+        let session = LanguageModelSession(
+            tools: [
+                ReadFileTool(),
+                WriteFileTool(),
+                EditFileTool(),
+                DeleteFileTool(),
+                MoveFileTool(),
+                ListDirectoryTool(),
+                CreateDirectoryTool(),
+                CheckPathTool()
+            ],
+            instructions: instructions
+        )
+        
+        logger.log("[fm-native-tools] requesting response, prompt len=\(prompt.count)")
+        
+        // The respond method automatically executes tools when the model requests them
+        let response = try await session.respond(to: prompt)
+        
+        logger.log("[fm-native-tools] got response len=\(response.content.count)")
+        return response.content
+    }
+    #endif
 
     // MARK: - Context management for Chat
 
-    /// Prepares a prompt that fits within an approximate context budget by summarizing older
-    /// messages into a compact system summary while preserving the most recent turns intact.
-    /// This avoids naive truncation of the user's latest content.
+    /// Prepares a prompt that fits within the strict 4096 token context limit.
+    /// Apple's on-device model cannot exceed this, so we must be VERY aggressive.
     private func prepareChatPrompt(messages: [ChatCompletionRequest.Message], model: String, temperature: Double?, maxTokens: Int?) async -> String {
-        // Build the full prompt first
-        let full = buildPrompt(from: messages)
-        let maxContextTokens = 4000
-        let reserveForOutput = 512 // reserve headroom for the model's response
-        let budget = max(1000, maxContextTokens - reserveForOutput)
-        let fullTokens = approxTokenCount(full)
-        if fullTokens <= budget {
-            logger.log("[chat.ctx] fit=full tokens=\(fullTokens) budget=\(budget) messages=\(messages.count)")
-            return full
+        // Apple's model has a HARD 4096 token limit (~16K chars total).
+        // With response needing ~1000 tokens, we can only use ~3000 tokens (~12K chars) for input.
+        // Being conservative: target 6K chars max to leave room for response.
+        let maxInputChars = 6000
+        
+        // Find the LAST user message - this is what actually matters
+        var lastUserContent = ""
+        for msg in messages.reversed() {
+            if msg.role == "user" {
+                lastUserContent = msg.content
+                break
+            }
         }
-
-        // Strategy:
-        // - Keep the last few messages intact (recent context is most relevant)
-        // - Summarize the older messages into a short summary via FoundationModels when available
-        // - Compose: system summary + recent messages
-        let keepRecentCount = min(6, messages.count) // keep up to last 6 messages
-        let recent = Array(messages.suffix(keepRecentCount))
-        let older = Array(messages.dropLast(keepRecentCount))
-
-        let olderText = older.isEmpty ? "" : buildPrompt(from: older)
-        var summary: String = ""
-        if !olderText.isEmpty {
-            // Summarize older content into ~1500 chars; clamp input size to avoid overflows
-            let clampInput = clampForSummarization(olderText, maxChars: 6000)
-            summary = await summarizeText(clampInput, targetChars: 1500, model: model, temperature: temperature)
+        
+        // Extract just the user's actual request (skip Xcode boilerplate)
+        var userRequest = lastUserContent
+        
+        // Look for "The user has asked:" pattern from Xcode extension
+        if let askedRange = userRequest.range(of: "The user has asked:", options: .caseInsensitive) {
+            userRequest = String(userRequest[askedRange.upperBound...]).trimmingCharacters(in: .whitespacesAndNewlines)
         }
-
+        
+        // Also check for "```" code blocks and extract file context if present
+        var fileContext = ""
+        if let codeStart = lastUserContent.range(of: "```") {
+            if let codeEnd = lastUserContent.range(of: "```", range: codeStart.upperBound..<lastUserContent.endIndex) {
+                let codeBlock = String(lastUserContent[codeStart.lowerBound..<codeEnd.upperBound])
+                // Only include if it's reasonably sized
+                if codeBlock.count < 2000 {
+                    fileContext = "Context:\n" + codeBlock + "\n\n"
+                } else {
+                    // Take just the first part of the code
+                    fileContext = "Context (truncated):\n" + String(codeBlock.prefix(1500)) + "...```\n\n"
+                }
+            }
+        }
+        
+        // Build minimal system context
+        let systemContext = "You are a helpful coding assistant."
+        
+        // Truncate user request if needed
+        let maxUserChars = maxInputChars - systemContext.count - fileContext.count - 200
+        if userRequest.count > maxUserChars {
+            userRequest = String(userRequest.prefix(maxUserChars)) + "..."
+        }
+        
+        // Build final prompt
         var parts: [String] = []
-        if !summary.isEmpty {
-            parts.append("system: Conversation summary (compressed): \n\(summary)")
+        parts.append("system: \(systemContext)")
+        if !fileContext.isEmpty {
+            parts.append(fileContext)
         }
-        parts.append(buildPrompt(from: recent))
-        let compact = parts.joined(separator: "\n")
-        let compactTokens = approxTokenCount(compact)
-        logger.log("[chat.ctx] fit=summarized tokens=\(compactTokens) budget=\(budget) keptRecent=\(recent.count) olderSummarized=\(older.count)")
-
-        // If still over budget, apply a second compression pass on the summary only.
-        if compactTokens > budget, !summary.isEmpty {
-            let tighter = await summarizeText(summary, targetChars: 800, model: model, temperature: temperature)
-            let rebuilt = ["system: Conversation summary (compressed): \n\(tighter)", buildPrompt(from: recent)].joined(separator: "\n")
-            let tokens = approxTokenCount(rebuilt)
-            logger.log("[chat.ctx] fit=summary-tight tokens=\(tokens) budget=\(budget) keptRecent=\(recent.count)")
-            return rebuilt
-        }
-        return compact
+        parts.append("user: \(userRequest)")
+        parts.append("assistant:")
+        
+        let result = parts.joined(separator: "\n")
+        let estimatedTokens = approxTokenCount(result)
+        
+        logger.log("[chat.ctx] final prompt: chars=\(result.count) tokens≈\(estimatedTokens)")
+        
+        return result
     }
 
     /// Rough token estimate (heuristic): ~4 chars per token.
@@ -557,16 +766,36 @@ final class FoundationModelsService: @unchecked Sendable {
     // Build a tool intro system message describing available tools and the JSON envelope to request them
     private func toolsDescription(_ tools: [OAITool]) -> String {
         var lines: [String] = []
-        lines.append("You can call tools when helpful. If a tool is needed, reply ONLY with a single JSON line in this exact schema and no extra text:")
-        lines.append("{\"tool_call\": {\"name\": \"<tool-name>\", \"arguments\": { /* args */ } }}")
+        lines.append("You have access to file operation tools. When you need to read, write, edit, or manage files, use these tools.")
+        lines.append("")
+        lines.append("To call a tool, reply ONLY with a single JSON object in this exact format (no other text):")
+        lines.append("{\"tool_call\": {\"name\": \"<tool-name>\", \"arguments\": { ... }}}")
         lines.append("")
         lines.append("Available tools:")
+        
+        // Include client-provided tools
         for t in tools {
             if t.type == "function", let f = t.function {
                 let desc = f.description ?? ""
                 lines.append("- \(f.name): \(desc)")
             }
         }
+        
+        // Always include built-in file tools
+        lines.append("")
+        lines.append("Built-in file tools (always available):")
+        lines.append("- read_file: Read contents of a file. Args: {\"path\": \"/absolute/path\", \"max_bytes\": 1048576}")
+        lines.append("- write_file: Create or overwrite a file. Args: {\"path\": \"/absolute/path\", \"content\": \"file contents\"}")
+        lines.append("- edit_file: Edit a file by replacing text. Args: {\"path\": \"/path\", \"old_text\": \"text to find\", \"new_text\": \"replacement\"}")
+        lines.append("- delete_file: Delete a file or directory. Args: {\"path\": \"/path\", \"recursive\": false}")
+        lines.append("- move_file: Move or rename a file. Args: {\"source_path\": \"/from\", \"destination_path\": \"/to\"}")
+        lines.append("- copy_file: Copy a file. Args: {\"source_path\": \"/from\", \"destination_path\": \"/to\"}")
+        lines.append("- list_directory: List directory contents. Args: {\"path\": \"/dir\", \"recursive\": false, \"include_hidden\": false}")
+        lines.append("- create_directory: Create a directory. Args: {\"path\": \"/new/dir\"}")
+        lines.append("- check_path: Check if path exists. Args: {\"path\": \"/path\"}")
+        lines.append("")
+        lines.append("IMPORTANT: Use absolute paths starting with /. After calling a tool, I will provide the result and you should respond based on it.")
+        
         return lines.joined(separator: "\n")
     }
 
@@ -614,14 +843,20 @@ final class FoundationModelsService: @unchecked Sendable {
         logger.log("Generating text (FoundationModels if available, else fallback)")
 
         #if canImport(FoundationModels)
-        if #available(iOS 26.0, macOS 26.0, visionOS 26.0, *) {
+        logger.log("[fm] FoundationModels framework is available at compile time")
+        if #available(macOS 26.0, iOS 26.0, visionOS 26.0, *) {
+            logger.log("[fm] Runtime availability check passed - attempting to use FoundationModels")
             do {
                 return try await generateWithFoundationModels(model: model, prompt: prompt, temperature: temperature)
             } catch {
                 logger.error("FoundationModels failed: \(String(describing: error))")
                 // Fall through to fallback message below without truncating the prompt
             }
+        } else {
+            logger.warning("[fm] Runtime availability check FAILED - macOS 26.0+ required. Current OS version does not meet requirements.")
         }
+        #else
+        logger.warning("[fm] FoundationModels framework NOT available at compile time")
         #endif
 
         // Fallback path when FoundationModels is not available on this platform/SDK.
@@ -665,6 +900,48 @@ final class FoundationModelsService: @unchecked Sendable {
         logger.log("[fm] requesting response len=\(prompt.count)")
         let response = try await session.respond(to: prompt)
         logger.log("[fm] got response len=\(response.content.count)")
+        return response.content
+    }
+    
+    /// Generate text with native Foundation Models Tool support
+    @available(iOS 26.0, macOS 26.0, visionOS 26.0, *)
+    private func generateWithTools(model: String, prompt: String, temperature: Double?) async throws -> String {
+        let systemModel = SystemLanguageModel.default
+        
+        // Check availability
+        switch systemModel.availability {
+        case .available:
+            break
+        case .unavailable(let reason):
+            throw NSError(domain: "FoundationModelsService", code: 1, userInfo: [NSLocalizedDescriptionKey: "Model unavailable: \(String(describing: reason))"])
+        }
+        
+        // Build instructions
+        var instructionsParts: [String] = []
+        instructionsParts.append("You are a helpful assistant with access to file operation tools.")
+        instructionsParts.append("When you need to read, write, edit, or manage files, use the available tools.")
+        instructionsParts.append("Requested model identifier: \(model)")
+        if let temperature { instructionsParts.append("Use creativity level (temperature): \(temperature)") }
+        let instructions = instructionsParts.joined(separator: "\n")
+        
+        // Create session with file tools
+        let session = LanguageModelSession(
+            tools: [
+                ReadFileTool(),
+                WriteFileTool(),
+                EditFileTool(),
+                DeleteFileTool(),
+                MoveFileTool(),
+                ListDirectoryTool(),
+                CreateDirectoryTool(),
+                CheckPathTool()
+            ],
+            instructions: instructions
+        )
+        
+        logger.log("[fm-tools] requesting response with tools, prompt len=\(prompt.count)")
+        let response = try await session.respond(to: prompt)
+        logger.log("[fm-tools] got response len=\(response.content.count)")
         return response.content
     }
     #endif
@@ -767,89 +1044,209 @@ extension FoundationModelsService {
 private final class ToolsRegistry: @unchecked Sendable {
     static let shared = ToolsRegistry()
     private let logger = Logger(subsystem: "com.example.PerspectiveIntelligence", category: "ToolsRegistry")
-
-    // Constrain all file operations to a single root directory.
-    // Set PI_WORKSPACE_ROOT in the environment to point at your workspace; defaults to Documents.
-    private let rootURL: URL
-    private let fm = FileManager.default
+    private let fileTools = FileToolsManager.shared
 
     private init() {
-        if let root = ProcessInfo.processInfo.environment["PI_WORKSPACE_ROOT"], !root.isEmpty {
-            self.rootURL = URL(fileURLWithPath: root)
-        } else {
-            self.rootURL = fm.urls(for: .documentDirectory, in: .userDomainMask).first ?? URL(fileURLWithPath: NSTemporaryDirectory())
-        }
-        logger.log("[tools] root=\(self.rootURL.path, privacy: .public)")
-    }
-
-    enum ToolError: Error, LocalizedError {
-        case invalidPath
-        case notFound
-        case ioFailed(String)
-        var errorDescription: String? {
-            switch self {
-            case .invalidPath: return "Invalid or out-of-root path"
-            case .notFound: return "Path not found"
-            case .ioFailed(let m): return m
-            }
-        }
+        logger.log("[tools] ToolsRegistry initialized with FileToolsManager")
     }
 
     // Execute a tool by name with JSONValue arguments
     func execute(name: String, arguments: JSONValue) async throws -> JSONValue {
+        logger.log("[tools] Executing tool: \(name, privacy: .public)")
+        
         switch name {
         case "read_file":
-            guard let path = argString(arguments, key: "path") else { return .object(["error": .string("Missing 'path'")]) }
-            let maxBytes = argInt(arguments, key: "max_bytes") ?? 256 * 1024
-            let url = try resolvePath(path)
-            guard fm.fileExists(atPath: url.path) else { throw ToolError.notFound }
-            let data = try Data(contentsOf: url)
-            let slice = data.prefix(maxBytes)
-            let text = String(decoding: slice, as: UTF8.self)
-            return .object(["path": .string(path), "content": .string(text), "truncated": .bool(slice.count < data.count)])
+            guard let path = argString(arguments, key: "path") else {
+                return .object(["error": .string("Missing 'path' argument")])
+            }
+            let maxBytes = argInt(arguments, key: "max_bytes") ?? argInt(arguments, key: "maxBytes") ?? 1024 * 1024
+            do {
+                let result = try fileTools.readFile(path: path, maxBytes: maxBytes)
+                return .object([
+                    "path": .string(result.path),
+                    "content": .string(result.content),
+                    "size": .number(Double(result.size)),
+                    "truncated": .bool(result.truncated)
+                ])
+            } catch {
+                return .object(["error": .string(error.localizedDescription)])
+            }
+            
         case "write_file":
-            guard let path = argString(arguments, key: "path") else { return .object(["error": .string("Missing 'path'")]) }
+            guard let path = argString(arguments, key: "path") else {
+                return .object(["error": .string("Missing 'path' argument")])
+            }
             let content = argString(arguments, key: "content") ?? ""
-            let url = try resolvePath(path)
             do {
-                try fm.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
-                try content.data(using: .utf8)?.write(to: url, options: .atomic)
+                let result = try fileTools.writeFile(path: path, content: content)
+                return .object([
+                    "path": .string(result.path),
+                    "bytes_written": .number(Double(result.bytesWritten)),
+                    "created": .bool(result.created)
+                ])
             } catch {
-                throw ToolError.ioFailed(String(describing: error))
+                return .object(["error": .string(error.localizedDescription)])
             }
-            return .object(["path": .string(path), "written_bytes": .number(Double(content.utf8.count))])
-        case "list_dir":
-            guard let path = argString(arguments, key: "path") else { return .object(["error": .string("Missing 'path'")]) }
-            let url = try resolvePath(path)
+            
+        case "edit_file":
+            guard let path = argString(arguments, key: "path") else {
+                return .object(["error": .string("Missing 'path' argument")])
+            }
+            let oldText = argString(arguments, key: "old_text") ?? argString(arguments, key: "oldText")
+            let newText = argString(arguments, key: "new_text") ?? argString(arguments, key: "newText") ?? ""
+            let lineNumber = argInt(arguments, key: "line_number") ?? argInt(arguments, key: "lineNumber")
             do {
-                let items = try fm.contentsOfDirectory(atPath: url.path)
-                return .object(["path": .string(path), "items": .array(items.map { .string($0) })])
+                let result = try fileTools.editFile(path: path, oldText: oldText, newText: newText, lineNumber: lineNumber)
+                return .object([
+                    "path": .string(result.path),
+                    "success": .bool(result.success),
+                    "message": .string(result.message),
+                    "changes_count": .number(Double(result.changesCount))
+                ])
             } catch {
-                throw ToolError.ioFailed(String(describing: error))
+                return .object(["error": .string(error.localizedDescription)])
             }
+            
+        case "delete_file":
+            guard let path = argString(arguments, key: "path") else {
+                return .object(["error": .string("Missing 'path' argument")])
+            }
+            let recursive = argBool(arguments, key: "recursive") ?? false
+            do {
+                let result = try fileTools.deleteFile(path: path, recursive: recursive)
+                return .object([
+                    "path": .string(result.path),
+                    "deleted": .bool(result.deleted),
+                    "was_directory": .bool(result.wasDirectory)
+                ])
+            } catch {
+                return .object(["error": .string(error.localizedDescription)])
+            }
+            
+        case "move_file":
+            guard let sourcePath = argString(arguments, key: "source_path") ?? argString(arguments, key: "sourcePath") else {
+                return .object(["error": .string("Missing 'source_path' argument")])
+            }
+            guard let destPath = argString(arguments, key: "destination_path") ?? argString(arguments, key: "destinationPath") else {
+                return .object(["error": .string("Missing 'destination_path' argument")])
+            }
+            do {
+                let result = try fileTools.moveFile(sourcePath: sourcePath, destinationPath: destPath)
+                return .object([
+                    "source_path": .string(result.sourcePath),
+                    "destination_path": .string(result.destinationPath),
+                    "success": .bool(result.success)
+                ])
+            } catch {
+                return .object(["error": .string(error.localizedDescription)])
+            }
+            
+        case "copy_file":
+            guard let sourcePath = argString(arguments, key: "source_path") ?? argString(arguments, key: "sourcePath") else {
+                return .object(["error": .string("Missing 'source_path' argument")])
+            }
+            guard let destPath = argString(arguments, key: "destination_path") ?? argString(arguments, key: "destinationPath") else {
+                return .object(["error": .string("Missing 'destination_path' argument")])
+            }
+            do {
+                let result = try fileTools.copyFile(sourcePath: sourcePath, destinationPath: destPath)
+                return .object([
+                    "source_path": .string(result.sourcePath),
+                    "destination_path": .string(result.destinationPath),
+                    "success": .bool(result.success)
+                ])
+            } catch {
+                return .object(["error": .string(error.localizedDescription)])
+            }
+            
+        case "list_directory", "list_dir":
+            guard let path = argString(arguments, key: "path") else {
+                return .object(["error": .string("Missing 'path' argument")])
+            }
+            let recursive = argBool(arguments, key: "recursive") ?? false
+            let includeHidden = argBool(arguments, key: "include_hidden") ?? argBool(arguments, key: "includeHidden") ?? false
+            do {
+                let result = try fileTools.listDirectory(path: path, recursive: recursive, includeHidden: includeHidden)
+                let itemsArray = result.items.map { item -> JSONValue in
+                    .object([
+                        "name": .string(item.name),
+                        "is_directory": .bool(item.isDirectory),
+                        "size": .number(Double(item.size))
+                    ])
+                }
+                return .object([
+                    "path": .string(result.path),
+                    "items": .array(itemsArray),
+                    "count": .number(Double(result.count))
+                ])
+            } catch {
+                return .object(["error": .string(error.localizedDescription)])
+            }
+            
+        case "create_directory":
+            guard let path = argString(arguments, key: "path") else {
+                return .object(["error": .string("Missing 'path' argument")])
+            }
+            do {
+                let result = try fileTools.createDirectory(path: path)
+                return .object([
+                    "path": .string(result.path),
+                    "created": .bool(result.created),
+                    "already_exists": .bool(result.alreadyExists)
+                ])
+            } catch {
+                return .object(["error": .string(error.localizedDescription)])
+            }
+            
+        case "check_path":
+            guard let path = argString(arguments, key: "path") else {
+                return .object(["error": .string("Missing 'path' argument")])
+            }
+            do {
+                let result = try fileTools.checkPath(path: path)
+                var obj: [String: JSONValue] = [
+                    "path": .string(result.path),
+                    "exists": .bool(result.exists),
+                    "is_directory": .bool(result.isDirectory),
+                    "is_file": .bool(result.isFile)
+                ]
+                if let size = result.size {
+                    obj["size"] = .number(Double(size))
+                }
+                return .object(obj)
+            } catch {
+                return .object(["error": .string(error.localizedDescription)])
+            }
+            
         default:
+            logger.warning("[tools] Unknown tool: \(name, privacy: .public)")
             return .object(["error": .string("Unknown tool: \(name)")])
         }
     }
 
     // Helpers
-    private func resolvePath(_ relative: String) throws -> URL {
-        let candidate = rootURL.appendingPathComponent(relative)
-        let standardized = candidate.standardized
-        // Prevent escaping from root
-        guard standardized.path.hasPrefix(rootURL.standardized.path) else { throw ToolError.invalidPath }
-        return standardized
-    }
-
     private func argString(_ args: JSONValue, key: String) -> String? {
         if case .object(let dict) = args, case .string(let s)? = dict[key] { return s }
         return nil
     }
+    
     private func argInt(_ args: JSONValue, key: String) -> Int? {
         if case .object(let dict) = args, let v = dict[key] {
             switch v {
             case .number(let d): return Int(d)
             case .string(let s): return Int(s)
+            default: return nil
+            }
+        }
+        return nil
+    }
+    
+    private func argBool(_ args: JSONValue, key: String) -> Bool? {
+        if case .object(let dict) = args, let v = dict[key] {
+            switch v {
+            case .bool(let b): return b
+            case .string(let s): return s.lowercased() == "true" || s == "1"
+            case .number(let d): return d != 0
             default: return nil
             }
         }

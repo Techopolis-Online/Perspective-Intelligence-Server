@@ -186,7 +186,7 @@ curl -X POST http://127.0.0.1:11434/debug/echo \
 
 ### Xcode 26 Intelligence Mode
 
-Xcode 26 introduces Intelligence Mode, an AI-powered assistant with Agent Mode that provides context-aware code suggestions. You can configure Xcode to use Perspective Intelligence as a locally hosted model provider.
+Xcode 26 introduces Intelligence Mode, an AI-powered assistant with Agent Mode that provides context-aware code suggestions. You can configure Xcode to use Perspective Intelligence as a locally hosted model provider since it implements the Ollama-compatible API that Xcode expects.
 
 #### Setup Instructions
 
@@ -207,9 +207,11 @@ Xcode 26 introduces Intelligence Mode, an AI-powered assistant with Agent Mode t
 
 6. Click **Add** to save the configuration.
 
-7. If successful, you should see **apple.local** appear in the list of available models.
+7. If successful, you should see **apple.local:latest** appear in the list of available models.
 
-8. Select **apple.local** as your active model.
+8. Select **apple.local:latest** as your active model.
+
+**Important**: If you have Ollama running, you must stop it first since both applications use port 11434 by default. Either stop Ollama or change the Perspective Intelligence port in the menu bar settings.
 
 #### Using Intelligence Mode
 
@@ -231,15 +233,44 @@ Once configured, you can access Intelligence Mode in Xcode:
 If the model doesn't appear in Xcode:
 
 1. Verify Perspective Intelligence server is running (check the menu bar icon)
-2. Confirm the port number matches your server configuration
-3. Restart Xcode after adding the model provider
-4. Check that Apple Intelligence is enabled on your Mac
+2. Confirm the port number matches your server configuration (default is 11434)
+3. Make sure no other service like Ollama is using the same port
+4. Restart Xcode after adding the model provider
+5. Check that Apple Intelligence is enabled on your Mac in System Settings
 
-For comparison, you can also configure cloud-hosted models in Xcode 26 Intelligence Mode:
+You can verify the server is working by running this command in Terminal:
 
-- **Anthropic Claude**: Use URL `https://api.anthropic.com/v1/messages` with header `x-api-key`
-- **OpenAI**: Use URL `https://api.openai.com` with header `x-api-key`
-- **OpenRouter**: Use a middleware aggregator for access to multiple models
+```bash
+curl http://127.0.0.1:11434/api/tags
+```
+
+You should see a response containing `apple.local:latest` in the models list.
+
+#### Alternative: Cloud-Hosted Models in Xcode 26
+
+For comparison, you can also configure cloud-hosted models in Xcode 26 Intelligence Mode using the **Internet Hosted** option:
+
+**Anthropic Claude** (recommended for code):
+
+| Setting | Value |
+|---------|-------|
+| URL | `https://api.anthropic.com/v1/messages` |
+| API Key | Your Anthropic API key |
+| API Key Header | `x-api-key` |
+| Description | Anthropic |
+
+**OpenAI**:
+
+| Setting | Value |
+|---------|-------|
+| URL | `https://api.openai.com` |
+| API Key | Your OpenAI API key |
+| API Key Header | `x-api-key` |
+| Description | OpenAI |
+
+**OpenRouter** (middleware aggregator for multiple models):
+
+Visit [OpenRouter.ai](https://openrouter.ai) to get an API key that provides access to models from Anthropic, OpenAI, Google, and others through a single endpoint.
 
 However, Perspective Intelligence offers the advantage of completely local, private AI assistance without requiring API keys or incurring usage costs.
 

@@ -29,37 +29,55 @@ struct ServerApp: App {
 final class ServerController: ObservableObject {
     @Published var isRunning: Bool = false
     @Published var port: UInt16 = 11434
+    @Published var errorMessage: String? = nil
 
     func start() {
-        self.isRunning = true
-        Task.detached(priority: .userInitiated) { [port] in
+        errorMessage = nil
+        Task {
             await LocalHTTPServer.shared.setPort(port)
             await LocalHTTPServer.shared.start()
-            // Do not immediately overwrite isRunning; the listener may report not-ready briefly.
+            // Wait a moment for the listener to become ready, then sync state
+            try? await Task.sleep(nanoseconds: 300_000_000) // 0.3 seconds
+            let running = await LocalHTTPServer.shared.getIsRunning()
+            let error = await LocalHTTPServer.shared.getLastError()
+            self.isRunning = running
+            self.errorMessage = error
         }
     }
 
     func stop() {
-        // Immediately reflect stopped state in UI
-        self.isRunning = false
-        Task.detached(priority: .userInitiated) { [weak self] in
+        Task {
             await LocalHTTPServer.shared.stop()
-            await self?.setRunning(false)
+            let running = await LocalHTTPServer.shared.getIsRunning()
+            self.isRunning = running
+            self.errorMessage = nil
         }
     }
 
     func restart() {
-        Task.detached(priority: .userInitiated) { [port, weak self] in
+        errorMessage = nil
+        Task {
             await LocalHTTPServer.shared.stop()
             await LocalHTTPServer.shared.setPort(port)
             await LocalHTTPServer.shared.start()
-            await self?.setRunning(true)
+            // Wait a moment for the listener to become ready, then sync state
+            try? await Task.sleep(nanoseconds: 300_000_000) // 0.3 seconds
+            let running = await LocalHTTPServer.shared.getIsRunning()
+            let error = await LocalHTTPServer.shared.getLastError()
+            self.isRunning = running
+            self.errorMessage = error
         }
     }
 
-    private func setRunning(_ value: Bool) {
-        // @MainActor context
-        self.isRunning = value
+    func syncState() {
+        Task {
+            let running = await LocalHTTPServer.shared.getIsRunning()
+            let serverPort = await LocalHTTPServer.shared.getPort()
+            let error = await LocalHTTPServer.shared.getLastError()
+            self.isRunning = running
+            self.port = serverPort
+            self.errorMessage = error
+        }
     }
 }
 
@@ -74,18 +92,37 @@ struct ServerStatusView: View {
         nf.maximum = 65535
         return nf
     }()
+    
+    private var statusText: String {
+        if server.isRunning {
+            return "Running on port \(server.port)"
+        } else if server.errorMessage != nil {
+            return "Failed to start"
+        } else {
+            return "Stopped"
+        }
+    }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 10) {
             HStack {
                 Circle()
-                    .fill(server.isRunning ? .green : .red)
+                    .fill(server.isRunning ? .green : (server.errorMessage != nil ? .orange : .red))
                     .frame(width: 10, height: 10)
-                Text(server.isRunning ? "Running on port \(server.port)" : "Stopped")
+                Text(statusText)
                     .font(.subheadline)
                     .foregroundStyle(.secondary)
                 Spacer()
             }
+            
+            // Show error message if present
+            if let error = server.errorMessage {
+                Text(error)
+                    .font(.caption)
+                    .foregroundStyle(.red)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+            
             HStack(spacing: 8) {
                 Button(server.isRunning ? "Restart" : "Start") {
                     server.port = localPort
@@ -106,7 +143,7 @@ struct ServerStatusView: View {
                 .font(.footnote)
                 .foregroundStyle(.secondary)
         }
-        .id(server.isRunning) // Force menu to refresh button labels when state changes
+        .id("\(server.isRunning)-\(server.errorMessage ?? "")") // Force menu to refresh when state changes
         .animation(.default, value: server.isRunning)
         .onAppear {
             localPort = server.port
